@@ -1,0 +1,502 @@
+--[[
+    Animation Inspector — Matcha
+    Live-reads playing AnimationTracks (via AnimationTracker memory scan),
+    shows name + asset id, logs unknowns, copies formatted lists to clipboard.
+
+    Controls:
+      X          — cycle / retarget nearest characters in selected folder
+      C          — copy logged list to clipboard
+      K          — clear log
+]]
+
+local previous = _G.__MatchaAnimInspector
+if previous and type(previous.stop) == "function" then
+    pcall(previous.stop)
+end
+
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local UIS = game:GetService("UserInputService")
+local Workspace = game:GetService("Workspace")
+local LocalPlayer = Players.LocalPlayer
+
+local THIS_RUN = {}
+_G.__MatchaAnimInspectorRun = THIS_RUN
+
+-- ==========================================
+-- Load AnimationTracker (same as Deepwoken tools)
+-- ==========================================
+
+local function safeLoad(url, name)
+    local ok, result = pcall(function()
+        local src = httpget(url)
+        if not src or src == "" then error("empty " .. url) end
+        return loadstring(src, name)()
+    end)
+    if not ok then
+        warn("[AnimInspector] load failed:", name, result)
+        return nil
+    end
+    return result
+end
+
+local AnimationTracker = safeLoad(
+    "https://raw.githubusercontent.com/artxficial/matchastuff/main/animationtracker.lua",
+    "animationtracker"
+) or _G.AnimationTracker
+
+if not AnimationTracker then
+    error("[AnimInspector] AnimationTracker required — script stopped")
+end
+
+local ESP_Utility = safeLoad(
+    "https://raw.githubusercontent.com/artxficial/matchastuff/main/esp_utility.lua",
+    "esp_utility"
+) or _G.ESP_Utility
+
+-- ==========================================
+-- State
+-- ==========================================
+
+local cfg = {
+    dead = false,
+    selectedFolder = nil,
+    maxRange = 120,
+    autoNearest = true,
+    trackSelf = true,   -- always track local character
+    trackOthers = true, -- also track nearby players/mobs in folder
+    logUnknownOnly = false,
+}
+
+local IgnoreIds = {} -- numeric ids to skip
+local Logged = {}    -- [assetId] = { Name, Id, Time, Speed, Source, Count, FirstSeen }
+local LoggedOrder = {}
+local TargetCharacters = {}
+local EspTrackers = {}
+local connections = {}
+local Tracker = AnimationTracker.new(IgnoreIds)
+
+local COLOR_WHITE = Color3.fromRGB(255, 255, 255)
+local COLOR_GREEN = Color3.fromRGB(80, 220, 120)
+local COLOR_RED = Color3.fromRGB(255, 80, 80)
+local COLOR_YELLOW = Color3.fromRGB(255, 220, 80)
+
+-- Optional known labels (extend anytime)
+local KnownLabels = {
+    -- generic examples; user can grow this table
+    ["rbxassetid://507770453"] = "Idle (default R15)",
+    ["rbxassetid://507777826"] = "Walk (default R15)",
+    ["rbxassetid://507767714"] = "Run (default R15)",
+    ["rbxassetid://507765000"] = "Jump (default R15)",
+    ["rbxassetid://507765644"] = "Fall (default R15)",
+    ["rbxassetid://522638767"] = "Climb (default)",
+    ["rbxassetid://507770239"] = "Swim (default)",
+}
+
+-- ==========================================
+-- Helpers
+-- ==========================================
+
+local function safeConnect(sig, fn)
+    if not sig then return nil end
+    local ok, c = pcall(function() return sig:Connect(fn) end)
+    if ok and c then
+        table.insert(connections, c)
+        return c
+    end
+    return nil
+end
+
+local function foldersInWorkspace()
+    local list = {}
+    for _, child in ipairs(Workspace:GetChildren()) do
+        if child.ClassName == "Folder" or child.ClassName == "Model" then
+            table.insert(list, child.Name)
+        end
+    end
+    table.sort(list)
+    return list
+end
+
+local function charactersInFolder()
+    if not cfg.selectedFolder then return {} end
+    local folder = Workspace:FindFirstChild(cfg.selectedFolder)
+    if not folder then return {} end
+    local out = {}
+    local localChar = LocalPlayer and LocalPlayer.Character
+    for _, m in ipairs(folder:GetChildren()) do
+        if m.ClassName == "Model" and m:FindFirstChildOfClass("Humanoid") then
+            -- never put local here; local is handled separately via trackSelf
+            if localChar and m == localChar then
+                -- skip
+            else
+                table.insert(out, m)
+            end
+        end
+    end
+    return out
+end
+
+local function describeAnim(assetId, trackName)
+    local id = tostring(assetId or "")
+    local known = KnownLabels[id]
+    if known then
+        return known
+    end
+    -- heuristic from track name
+    local n = string.lower(tostring(trackName or ""))
+    if n:find("slash") or n:find("swing") or n:find("attack") or n:find("punch") or n:find("kick") then
+        return "Likely attack / combat"
+    end
+    if n:find("idle") then return "Idle"
+    elseif n:find("walk") then return "Walk"
+    elseif n:find("run") then return "Run"
+    elseif n:find("jump") then return "Jump"
+    elseif n:find("fall") then return "Fall"
+    elseif n:find("climb") then return "Climb"
+    elseif n:find("swim") then return "Swim"
+    elseif n:find("sit") or n:find("seat") then return "Sit"
+    elseif n:find("emote") or n:find("dance") then return "Emote / dance"
+    elseif n:find("block") or n:find("parry") or n:find("guard") then return "Block / parry"
+    elseif n:find("stun") or n:find("hit") or n:find("hurt") then return "Hit / stun reaction"
+    elseif n:find("die") or n:find("death") then return "Death"
+    elseif n:find("reload") then return "Reload"
+    elseif n:find("equip") or n:find("unequip") then return "Equip / unequip"
+    end
+    return "Unknown action"
+end
+
+local function logAnim(assetId, track)
+    if not assetId or assetId == "" then return end
+    local id = tostring(assetId)
+    local numeric = tonumber(id:match("%d+"))
+    if numeric and table.find(IgnoreIds, numeric) then return end
+
+    local entry = Logged[id]
+    if not entry then
+        entry = {
+            Name = track.Name or "?",
+            Id = id,
+            Time = track.TimePosition or 0,
+            Speed = track.Speed or 1,
+            Source = "live",
+            Count = 1,
+            FirstSeen = os.clock(),
+            Label = describeAnim(id, track.Name),
+        }
+        Logged[id] = entry
+        table.insert(LoggedOrder, id)
+    else
+        entry.Count = entry.Count + 1
+        entry.Time = track.TimePosition or entry.Time
+        entry.Speed = track.Speed or entry.Speed
+        if track.Name and track.Name ~= "" then
+            entry.Name = track.Name
+            entry.Label = describeAnim(id, track.Name)
+        end
+    end
+end
+
+local function formatEntry(entry)
+    return string.format(
+        "[%s]  %s  |  %s  |  speed=%.2f  seen=%d",
+        entry.Id,
+        entry.Name or "?",
+        entry.Label or "Unknown",
+        entry.Speed or 1,
+        entry.Count or 1
+    )
+end
+
+local function copyLogged()
+    if #LoggedOrder == 0 then
+        print("[AnimInspector] Nothing logged yet")
+        pcall(function() if notify then notify("Nothing logged", "Anim Inspector", 2) end end)
+        return
+    end
+    local lines = {
+        "-- Animation Inspector export",
+        string.format("-- PlaceId: %s  Game: %s", tostring(game.PlaceId), tostring(game.Name)),
+        string.format("-- Count: %d", #LoggedOrder),
+        "",
+    }
+    for _, id in ipairs(LoggedOrder) do
+        local e = Logged[id]
+        if e then
+            table.insert(lines, formatEntry(e))
+            -- also paste a ready GameConfig-ish snippet
+            table.insert(lines, string.format(
+                '  ["%s"] = { DisplayName = "%s", Label = "%s" },',
+                e.Id,
+                (e.Name or "?"):gsub('"', "'"),
+                (e.Label or "Unknown"):gsub('"', "'")
+            ))
+            table.insert(lines, "")
+        end
+    end
+    local text = table.concat(lines, "\n")
+    setclipboard(text)
+    print("[AnimInspector] Copied", #LoggedOrder, "animations to clipboard")
+    pcall(function()
+        if notify then notify("Copied " .. #LoggedOrder .. " anims", "Anim Inspector", 3) end
+    end)
+end
+
+local function clearLog()
+    table.clear(Logged)
+    table.clear(LoggedOrder)
+    print("[AnimInspector] Log cleared")
+end
+
+-- ==========================================
+-- Targeting + ESP
+-- ==========================================
+
+local function clearEsp()
+    for _, t in pairs(EspTrackers) do
+        if t and t.Destroy then pcall(function() t:Destroy() end) end
+    end
+    table.clear(EspTrackers)
+    table.clear(TargetCharacters)
+end
+
+local function setTargets(list)
+    clearEsp()
+    local localChar = LocalPlayer and LocalPlayer.Character
+    for _, char in ipairs(list) do
+        table.insert(TargetCharacters, char)
+        if ESP_Utility and char:FindFirstChild("HumanoidRootPart") then
+            local isSelf = localChar and char == localChar
+            local label = isSelf and ("YOU · " .. char.Name) or char.Name
+            local color = isSelf and COLOR_YELLOW or COLOR_GREEN
+            local tr = ESP_Utility.NewTracker(char.HumanoidRootPart, label, color)
+            if tr and tr.AddText then
+                pcall(function() tr:AddText("Anims", nil, "…") end)
+            end
+            EspTrackers[char] = tr
+        end
+    end
+end
+
+local function cycleTargets()
+    local localChar = LocalPlayer and LocalPlayer.Character
+    local root = localChar and localChar:FindFirstChild("HumanoidRootPart")
+    local picks = {}
+
+    -- 1) Always track yourself when enabled (works even with no folder selected)
+    if cfg.trackSelf and localChar and localChar:FindFirstChildOfClass("Humanoid") then
+        table.insert(picks, localChar)
+    end
+
+    -- 2) Optionally track others in the selected folder
+    if cfg.trackOthers and root then
+        local all = charactersInFolder()
+        local scored = {}
+        for _, char in ipairs(all) do
+            if char ~= localChar then
+                local hrp = char:FindFirstChild("HumanoidRootPart")
+                if hrp then
+                    local d = (hrp.Position - root.Position).Magnitude
+                    if d <= cfg.maxRange then
+                        table.insert(scored, { char = char, d = d })
+                    end
+                end
+            end
+        end
+        table.sort(scored, function(a, b) return a.d < b.d end)
+        for i = 1, math.min(5, #scored) do
+            table.insert(picks, scored[i].char)
+        end
+    end
+
+    setTargets(picks)
+    print(string.format(
+        "[AnimInspector] Tracking %d target(s)  self=%s  others=%s",
+        #picks,
+        tostring(cfg.trackSelf),
+        tostring(cfg.trackOthers)
+    ))
+end
+
+-- ==========================================
+-- Main update
+-- ==========================================
+
+local function updateTargets()
+    for i = #TargetCharacters, 1, -1 do
+        local char = TargetCharacters[i]
+        local hum = char and char:FindFirstChildOfClass("Humanoid")
+        local hrp = char and char:FindFirstChild("HumanoidRootPart")
+        local tracker = EspTrackers[char]
+
+        if not char or not char.Parent or not hum or not hrp then
+            if tracker and tracker.Destroy then pcall(function() tracker:Destroy() end) end
+            EspTrackers[char] = nil
+            table.remove(TargetCharacters, i)
+            continue
+        end
+
+        local ok, anims = pcall(function() return Tracker:Update(char) end)
+        anims = (ok and anims) or {}
+
+        local lines = {}
+        if #anims == 0 then
+            table.insert(lines, "None playing")
+        else
+            for _, anim in ipairs(anims) do
+                if not anim.AnimationId then continue end
+                local id = tostring(anim.AnimationId)
+                local label = describeAnim(id, anim.Name)
+                logAnim(id, anim)
+
+                table.insert(lines, string.format(
+                    "%s\n  %s\n  %s | t=%.2f spd=%.2f",
+                    anim.Name or "?",
+                    label,
+                    id,
+                    anim.TimePosition or 0,
+                    anim.Speed or 1
+                ))
+            end
+        end
+
+        if tracker and tracker.ChangeText then
+            pcall(function()
+                tracker:ChangeText("Anims", table.concat(lines, "\n\n"), COLOR_WHITE)
+                tracker:ChangeText("Name", string.format("%s [%d logged]", char.Name, #LoggedOrder), COLOR_GREEN)
+            end)
+        end
+    end
+end
+
+-- ==========================================
+-- UI (Matcha native)
+-- ==========================================
+
+local function buildUI()
+    if not UI or not UI.AddTab then
+        print("[AnimInspector] Matcha UI global missing — hotkeys still work")
+        return
+    end
+    pcall(function() UI.RemoveTab("AnimInspect") end)
+
+    UI.AddTab("AnimInspect", function(tab)
+        if cfg.dead then return end
+
+        local left = tab:Section("Targets", "Left")
+        left:Toggle("ai_self", "Track myself", cfg.trackSelf, function(on)
+            cfg.trackSelf = on and true or false
+            cycleTargets()
+        end)
+        left:Toggle("ai_others", "Track others nearby", cfg.trackOthers, function(on)
+            cfg.trackOthers = on and true or false
+            cycleTargets()
+        end)
+        left:Toggle("ai_auto", "Auto refresh targets", cfg.autoNearest, function(on)
+            cfg.autoNearest = on and true or false
+        end)
+        left:SliderInt("ai_range", "Others max range", 10, 300, cfg.maxRange, function(v)
+            cfg.maxRange = v
+        end)
+
+        local folders = foldersInWorkspace()
+        left:Combo("ai_folder", "Folder", folders, 0, function(idx, text)
+            cfg.selectedFolder = text
+            cycleTargets()
+        end)
+        -- try common defaults
+        for i, name in ipairs(folders) do
+            if name == "Live" or name == "Players" or name == "Characters" then
+                cfg.selectedFolder = name
+                break
+            end
+        end
+        if not cfg.selectedFolder and #folders > 0 then
+            cfg.selectedFolder = folders[1]
+        end
+
+        left:Button("Refresh targets (X)", function()
+            cycleTargets()
+        end)
+
+        local right = tab:Section("Log", "Right")
+        right:Button("Copy log to clipboard (C)", function()
+            copyLogged()
+        end)
+        right:Button("Clear log (K)", function()
+            clearLog()
+        end)
+        right:Text("Logged entries show above targets as ESP text.")
+        right:Text("Copy format includes asset id, track name, guessed action, and a config snippet.")
+    end)
+end
+
+-- ==========================================
+-- Input
+-- ==========================================
+
+local VK = { X = 0x58, C = 0x43, K = 0x4B }
+local last = { x = false, c = false, k = false }
+
+local function pollHotkeys()
+    if type(iskeypressed) ~= "function" then return end
+    local x = iskeypressed(VK.X)
+    local c = iskeypressed(VK.C)
+    local k = iskeypressed(VK.K)
+    if x and not last.x then cycleTargets() end
+    if c and not last.c then copyLogged() end
+    if k and not last.k then clearLog() end
+    last.x, last.c, last.k = x, c, k
+end
+
+safeConnect(UIS and UIS.InputBegan, function(input, gp)
+    if gp then return end
+    local code = input and input.KeyCode
+    if code == Enum.KeyCode.X then cycleTargets()
+    elseif code == Enum.KeyCode.C then copyLogged()
+    elseif code == Enum.KeyCode.K then clearLog()
+    end
+end)
+
+-- ==========================================
+-- Loop + lifecycle
+-- ==========================================
+
+local lastCycle = 0
+
+local function stop()
+    if cfg.dead then return end
+    cfg.dead = true
+    clearEsp()
+    for _, c in ipairs(connections) do
+        pcall(function() c:Disconnect() end)
+    end
+    connections = {}
+    pcall(function() if UI and UI.RemoveTab then UI.RemoveTab("AnimInspect") end end)
+    if _G.__MatchaAnimInspectorRun == THIS_RUN then
+        _G.__MatchaAnimInspectorRun = nil
+    end
+    _G.__MatchaAnimInspector = nil
+end
+
+_G.__MatchaAnimInspector = { stop = stop, run = THIS_RUN }
+
+local stepped = RunService and (RunService.RenderStepped or RunService.Heartbeat)
+safeConnect(stepped, function()
+    if cfg.dead or _G.__MatchaAnimInspectorRun ~= THIS_RUN then return end
+    pollHotkeys()
+    local now = os.clock()
+    if cfg.autoNearest and (now - lastCycle) > 1.0 then
+        lastCycle = now
+        cycleTargets()
+    end
+    updateTargets()
+end)
+
+pcall(buildUI)
+cycleTargets()
+
+print("[AnimInspector] Loaded — X retarget · C copy log · K clear")
+pcall(function()
+    if notify then notify("X retarget · C copy · K clear", "Anim Inspector", 4) end
+end)
