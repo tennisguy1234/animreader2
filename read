@@ -1,12 +1,11 @@
 --[[
-    Animation Inspector — Matcha
-    Live-reads playing AnimationTracks (via AnimationTracker memory scan),
-    shows name + asset id, logs unknowns, copies formatted lists to clipboard.
+    Animation Inspector — Matcha (fixed)
+    - Safe LocalPlayer re-fetch (stops nil.LocalPlayer spam)
+    - Sanitizes garbage track names from memory reads
+    - Auto-picks common character folders (Live, Players, Entities, etc.)
+    - pcall-wrapped target loop
 
-    Controls:
-      X          — cycle / retarget nearest characters in selected folder
-      C          — copy logged list to clipboard
-      K          — clear log
+    Controls: X retarget · C copy log · K clear
 ]]
 
 local previous = _G.__MatchaAnimInspector
@@ -18,14 +17,17 @@ local Players = game:GetService("Players")
 local RunService = game:GetService("RunService")
 local UIS = game:GetService("UserInputService")
 local Workspace = game:GetService("Workspace")
-local LocalPlayer = Players.LocalPlayer
 
 local THIS_RUN = {}
 _G.__MatchaAnimInspectorRun = THIS_RUN
 
--- ==========================================
--- Load AnimationTracker (same as Deepwoken tools)
--- ==========================================
+local function getLP()
+    local ok, lp = pcall(function()
+        return Players.LocalPlayer
+    end)
+    if ok and lp then return lp end
+    return nil
+end
 
 local function safeLoad(url, name)
     local ok, result = pcall(function()
@@ -54,22 +56,141 @@ local ESP_Utility = safeLoad(
     "esp_utility"
 ) or _G.ESP_Utility
 
--- ==========================================
--- State
--- ==========================================
+-- Patch ESP_Utility: original uses game.Players.LocalPlayer unguarded (Matcha nil spam + broken ESP)
+if ESP_Utility then
+    function ESP_Utility:_GetDistance()
+        local lp = nil
+        pcall(function() lp = game:GetService("Players").LocalPlayer end)
+        if not lp then return 0 end
+        local character = lp.Character
+        if not character then return 0 end
+        local hrp = character:FindFirstChild("HumanoidRootPart")
+        if not hrp then return 0 end
+        local ok, dist = pcall(function()
+            local a, b = hrp.Position, self.Object.Position
+            local dx, dy, dz = b.X - a.X, b.Y - a.Y, b.Z - a.Z
+            return math.sqrt(dx * dx + dy * dy + dz * dz)
+        end)
+        return (ok and dist) or 0
+    end
+    -- Softer on-screen check: show if center is visible, not all 8 corners
+    function ESP_Utility:_Get2D_Bounds()
+        if not self.Object then return nil end
+        local position = self.Object.Position
+        local size = self.Object.Size
+        local half = size * 0.5
+        local minX, minY = math.huge, math.huge
+        local maxX, maxY = -math.huge, -math.huge
+        local anyOnScreen = false
+        local corners = {
+            Vector3.new(-1, -1, -1), Vector3.new(1, -1, -1),
+            Vector3.new(1, -1, 1), Vector3.new(-1, -1, 1),
+            Vector3.new(-1, 1, -1), Vector3.new(1, 1, -1),
+            Vector3.new(1, 1, 1), Vector3.new(-1, 1, 1),
+        }
+        for i = 1, 8 do
+            local o = corners[i]
+            local worldPos = Vector3.new(
+                position.X + o.X * half.X,
+                position.Y + o.Y * half.Y,
+                position.Z + o.Z * half.Z
+            )
+            local screenPos, onScreen = WorldToScreen(worldPos)
+            if onScreen and screenPos then
+                anyOnScreen = true
+                if screenPos.X < minX then minX = screenPos.X end
+                if screenPos.Y < minY then minY = screenPos.Y end
+                if screenPos.X > maxX then maxX = screenPos.X end
+                if screenPos.Y > maxY then maxY = screenPos.Y end
+            end
+        end
+        if not anyOnScreen then
+            -- fallback: center only
+            local center, vis = WorldToScreen(position)
+            if not vis or not center then return nil end
+            local top, topVis = WorldToScreen(position + Vector3.new(0, half.Y, 0))
+            local h = (topVis and top) and math.abs(center.Y - top.Y) * 4 or 40
+            local w = h * 0.8
+            return center.X - w * 0.5, center.Y - h * 0.5, center.X + w * 0.5, center.Y + h * 0.5
+        end
+        -- pad tiny boxes
+        if maxX - minX < 20 then local c = (minX + maxX) * 0.5; minX, maxX = c - 10, c + 10 end
+        if maxY - minY < 20 then local c = (minY + maxY) * 0.5; minY, maxY = c - 10, c + 10 end
+        return minX, minY, maxX, maxY
+    end
+    
+    function ESP_Utility:_IsAlive()
+        if not self or not self.Object then return false end
+        local obj = self.Object
+        -- Matcha: game.Workspace can be nil; use workspace global / GetService
+        local ws = workspace
+        if not ws then
+            pcall(function() ws = game:GetService("Workspace") end)
+        end
+        if not ws then return false end
+        local ok, inside = pcall(function()
+            return obj:IsDescendantOf(ws)
+        end)
+        return ok and inside == true
+    end
+
+    local _oldUpdate = ESP_Utility._Update
+    function ESP_Utility:_Update()
+        local ok, err = pcall(function()
+            if not self or not self.Object then return end
+            if not self:_IsAlive() then
+                if self.Destroy then pcall(function() self:Destroy() end) end
+                return
+            end
+            local min_x, min_y, max_x, max_y = self:_Get2D_Bounds()
+            self.TrackerOffScreen = (min_x == nil)
+            if not self:_DetermineVisibility() then return end
+            if min_x == nil then return end
+            local boxWidth = max_x - min_x
+            self.Session = {
+                CenterX = min_x + (boxWidth / 2),
+                TopY = min_y,
+            }
+            if not self.Drawings or not self.Drawings["Square"] then return end
+            local Square = self.Drawings["Square"].Drawing
+            if Square then
+                Square.Position = Vector2.new(min_x, min_y)
+                Square.Size = Vector2.new(boxWidth, max_y - min_y)
+            end
+            if not self.DrawingOrder then return end
+            for _, TextReference in ipairs(self.DrawingOrder) do
+                local Data = self.Drawings[TextReference]
+                if not Data then continue end
+                local DrawingObject = Data.Drawing
+                if not DrawingObject then continue end
+                if Data.Function then
+                    local ok2, result = pcall(Data.Function)
+                    if ok2 and result ~= nil then
+                        DrawingObject.Text = tostring(result)
+                    end
+                end
+                if self._Position then
+                    pcall(function() self:_Position(DrawingObject, Data.Y_Offset) end)
+                end
+            end
+        end)
+        -- swallow errors so one bad tracker doesn't spam
+    end
+
+    print("[AnimInspector] ESP_Utility patched (LocalPlayer-safe + softer bounds + alive/update)")
+end
 
 local cfg = {
     dead = false,
     selectedFolder = nil,
     maxRange = 120,
     autoNearest = true,
-    trackSelf = true,   -- always track local character
-    trackOthers = true, -- also track nearby players/mobs in folder
-    logUnknownOnly = false,
+    trackSelf = true,
+    trackOthers = true,
 }
 
-local IgnoreIds = {} -- numeric ids to skip
-local Logged = {}    -- [assetId] = { Name, Id, Time, Speed, Source, Count, FirstSeen }
+local IgnoreIds = {}
+local Logged = {}
 local LoggedOrder = {}
 local TargetCharacters = {}
 local EspTrackers = {}
@@ -78,12 +199,9 @@ local Tracker = AnimationTracker.new(IgnoreIds)
 
 local COLOR_WHITE = Color3.fromRGB(255, 255, 255)
 local COLOR_GREEN = Color3.fromRGB(80, 220, 120)
-local COLOR_RED = Color3.fromRGB(255, 80, 80)
 local COLOR_YELLOW = Color3.fromRGB(255, 220, 80)
 
--- Optional known labels (extend anytime)
 local KnownLabels = {
-    -- generic examples; user can grow this table
     ["rbxassetid://507770453"] = "Idle (default R15)",
     ["rbxassetid://507777826"] = "Walk (default R15)",
     ["rbxassetid://507767714"] = "Run (default R15)",
@@ -92,10 +210,6 @@ local KnownLabels = {
     ["rbxassetid://522638767"] = "Climb (default)",
     ["rbxassetid://507770239"] = "Swim (default)",
 }
-
--- ==========================================
--- Helpers
--- ==========================================
 
 local function safeConnect(sig, fn)
     if not sig then return nil end
@@ -107,45 +221,32 @@ local function safeConnect(sig, fn)
     return nil
 end
 
-local function foldersInWorkspace()
-    local list = {}
-    for _, child in ipairs(Workspace:GetChildren()) do
-        if child.ClassName == "Folder" or child.ClassName == "Model" then
-            table.insert(list, child.Name)
-        end
-    end
-    table.sort(list)
-    return list
+local function sanitizeName(s)
+    if type(s) ~= "string" then return nil end
+    local cleaned = s:gsub("[^%w%_%-%.%/ ]", "")
+    cleaned = cleaned:match("^%s*(.-)%s*$") or ""
+    if #cleaned < 2 then return nil end
+    if cleaned:match("^[%W%d%s]+$") and not cleaned:match("%a") then return nil end
+    return cleaned
 end
 
-local function charactersInFolder()
-    if not cfg.selectedFolder then return {} end
-    local folder = Workspace:FindFirstChild(cfg.selectedFolder)
-    if not folder then return {} end
-    local out = {}
-    local localChar = LocalPlayer and LocalPlayer.Character
-    for _, m in ipairs(folder:GetChildren()) do
-        if m.ClassName == "Model" and m:FindFirstChildOfClass("Humanoid") then
-            -- never put local here; local is handled separately via trackSelf
-            if localChar and m == localChar then
-                -- skip
-            else
-                table.insert(out, m)
-            end
-        end
+local function normalizeId(assetId)
+    local id = tostring(assetId or "")
+    if id == "" then return nil end
+    if not id:find("rbxassetid://", 1, true) then
+        local num = id:match("(%d+)")
+        if num then id = "rbxassetid://" .. num end
     end
-    return out
+    return id
 end
 
 local function describeAnim(assetId, trackName)
-    local id = tostring(assetId or "")
-    local known = KnownLabels[id]
-    if known then
-        return known
-    end
-    -- heuristic from track name
-    local n = string.lower(tostring(trackName or ""))
-    if n:find("slash") or n:find("swing") or n:find("attack") or n:find("punch") or n:find("kick") then
+    local id = normalizeId(assetId) or ""
+    if KnownLabels[id] then return KnownLabels[id] end
+    local n = string.lower(tostring(sanitizeName(trackName) or ""))
+    if n == "" then return "Unknown action" end
+    if n:find("slash") or n:find("swing") or n:find("attack") or n:find("punch")
+        or n:find("kick") or n:find("stab") or n:find("m1") or n:find("lunge") then
         return "Likely attack / combat"
     end
     if n:find("idle") then return "Idle"
@@ -153,46 +254,50 @@ local function describeAnim(assetId, trackName)
     elseif n:find("run") then return "Run"
     elseif n:find("jump") then return "Jump"
     elseif n:find("fall") then return "Fall"
-    elseif n:find("climb") then return "Climb"
-    elseif n:find("swim") then return "Swim"
-    elseif n:find("sit") or n:find("seat") then return "Sit"
-    elseif n:find("emote") or n:find("dance") then return "Emote / dance"
     elseif n:find("block") or n:find("parry") or n:find("guard") then return "Block / parry"
     elseif n:find("stun") or n:find("hit") or n:find("hurt") then return "Hit / stun reaction"
-    elseif n:find("die") or n:find("death") then return "Death"
-    elseif n:find("reload") then return "Reload"
-    elseif n:find("equip") or n:find("unequip") then return "Equip / unequip"
     end
     return "Unknown action"
 end
 
+local function displayNameFor(id, trackName)
+    if KnownLabels[id] then return KnownLabels[id] end
+    local clean = sanitizeName(trackName)
+    if clean then return clean end
+    local num = tostring(id):match("(%d+)")
+    return num and ("Anim_" .. num:sub(-6)) or "Unknown"
+end
+
 local function logAnim(assetId, track)
-    if not assetId or assetId == "" then return end
-    local id = tostring(assetId)
+    local id = normalizeId(assetId)
+    if not id then return end
     local numeric = tonumber(id:match("%d+"))
     if numeric and table.find(IgnoreIds, numeric) then return end
 
+    local name = displayNameFor(id, track and track.Name)
     local entry = Logged[id]
     if not entry then
         entry = {
-            Name = track.Name or "?",
+            Name = name,
             Id = id,
-            Time = track.TimePosition or 0,
-            Speed = track.Speed or 1,
-            Source = "live",
+            Time = track and track.TimePosition or 0,
+            Speed = track and track.Speed or 1,
             Count = 1,
-            FirstSeen = os.clock(),
-            Label = describeAnim(id, track.Name),
+            Label = describeAnim(id, track and track.Name),
         }
         Logged[id] = entry
         table.insert(LoggedOrder, id)
     else
         entry.Count = entry.Count + 1
-        entry.Time = track.TimePosition or entry.Time
-        entry.Speed = track.Speed or entry.Speed
-        if track.Name and track.Name ~= "" then
-            entry.Name = track.Name
-            entry.Label = describeAnim(id, track.Name)
+        entry.Time = (track and track.TimePosition) or entry.Time
+        entry.Speed = (track and track.Speed) or entry.Speed
+        local clean = sanitizeName(track and track.Name)
+        if clean then
+            entry.Name = clean
+            entry.Label = describeAnim(id, clean)
+        elseif KnownLabels[id] then
+            entry.Name = KnownLabels[id]
+            entry.Label = KnownLabels[id]
         end
     end
 end
@@ -211,7 +316,6 @@ end
 local function copyLogged()
     if #LoggedOrder == 0 then
         print("[AnimInspector] Nothing logged yet")
-        pcall(function() if notify then notify("Nothing logged", "Anim Inspector", 2) end end)
         return
     end
     local lines = {
@@ -224,7 +328,6 @@ local function copyLogged()
         local e = Logged[id]
         if e then
             table.insert(lines, formatEntry(e))
-            -- also paste a ready GameConfig-ish snippet
             table.insert(lines, string.format(
                 '  ["%s"] = { DisplayName = "%s", Label = "%s" },',
                 e.Id,
@@ -234,8 +337,7 @@ local function copyLogged()
             table.insert(lines, "")
         end
     end
-    local text = table.concat(lines, "\n")
-    setclipboard(text)
+    setclipboard(table.concat(lines, "\n"))
     print("[AnimInspector] Copied", #LoggedOrder, "animations to clipboard")
     pcall(function()
         if notify then notify("Copied " .. #LoggedOrder .. " anims", "Anim Inspector", 3) end
@@ -248,9 +350,38 @@ local function clearLog()
     print("[AnimInspector] Log cleared")
 end
 
--- ==========================================
--- Targeting + ESP
--- ==========================================
+local function foldersInWorkspace()
+    local list = {}
+    local ok, children = pcall(function() return Workspace:GetChildren() end)
+    if not ok or type(children) ~= "table" then return list end
+    for _, child in ipairs(children) do
+        local cls = child.ClassName
+        if cls == "Folder" or cls == "Model" then
+            table.insert(list, child.Name)
+        end
+    end
+    table.sort(list)
+    return list
+end
+
+local function charactersInFolder()
+    if not cfg.selectedFolder then return {} end
+    local folder = Workspace:FindFirstChild(cfg.selectedFolder)
+    if not folder then return {} end
+    local out = {}
+    local lp = getLP()
+    local localChar = lp and lp.Character
+    local ok, children = pcall(function() return folder:GetChildren() end)
+    if not ok or type(children) ~= "table" then return out end
+    for _, m in ipairs(children) do
+        if m.ClassName == "Model" and m:FindFirstChildOfClass("Humanoid") then
+            if not (localChar and m == localChar) then
+                table.insert(out, m)
+            end
+        end
+    end
+    return out
+end
 
 local function clearEsp()
     for _, t in pairs(EspTrackers) do
@@ -262,116 +393,112 @@ end
 
 local function setTargets(list)
     clearEsp()
-    local localChar = LocalPlayer and LocalPlayer.Character
+    local lp = getLP()
+    local localChar = lp and lp.Character
     for _, char in ipairs(list) do
+        if not char then continue end
         table.insert(TargetCharacters, char)
         if ESP_Utility and char:FindFirstChild("HumanoidRootPart") then
             local isSelf = localChar and char == localChar
-            local label = isSelf and ("YOU · " .. char.Name) or char.Name
+            local label = isSelf and ("YOU · " .. tostring(char.Name)) or tostring(char.Name)
             local color = isSelf and COLOR_YELLOW or COLOR_GREEN
-            local tr = ESP_Utility.NewTracker(char.HumanoidRootPart, label, color)
-            if tr and tr.AddText then
-                pcall(function() tr:AddText("Anims", nil, "…") end)
+            local ok, tr = pcall(function()
+                return ESP_Utility.NewTracker(char.HumanoidRootPart, label, color)
+            end)
+            if ok and tr then
+                pcall(function()
+                    if tr.AddText then tr:AddText("Anims", nil, "...") end
+                end)
+                EspTrackers[char] = tr
             end
-            EspTrackers[char] = tr
         end
     end
 end
 
 local function cycleTargets()
-    local localChar = LocalPlayer and LocalPlayer.Character
-    local root = localChar and localChar:FindFirstChild("HumanoidRootPart")
-    local picks = {}
+    pcall(function()
+        local lp = getLP()
+        local localChar = lp and lp.Character
+        local root = localChar and localChar:FindFirstChild("HumanoidRootPart")
+        local picks = {}
 
-    -- 1) Always track yourself when enabled (works even with no folder selected)
-    if cfg.trackSelf and localChar and localChar:FindFirstChildOfClass("Humanoid") then
-        table.insert(picks, localChar)
-    end
+        if cfg.trackSelf and localChar and localChar:FindFirstChildOfClass("Humanoid") then
+            table.insert(picks, localChar)
+        end
 
-    -- 2) Optionally track others in the selected folder
-    if cfg.trackOthers and root then
-        local all = charactersInFolder()
-        local scored = {}
-        for _, char in ipairs(all) do
-            if char ~= localChar then
-                local hrp = char:FindFirstChild("HumanoidRootPart")
-                if hrp then
-                    local d = (hrp.Position - root.Position).Magnitude
-                    if d <= cfg.maxRange then
-                        table.insert(scored, { char = char, d = d })
+        if cfg.trackOthers and root then
+            local all = charactersInFolder()
+            local scored = {}
+            for _, char in ipairs(all) do
+                if char ~= localChar then
+                    local hrp = char:FindFirstChild("HumanoidRootPart")
+                    if hrp then
+                        local d = (hrp.Position - root.Position).Magnitude
+                        if d <= cfg.maxRange then
+                            table.insert(scored, { char = char, d = d })
+                        end
                     end
                 end
             end
-        end
-        table.sort(scored, function(a, b) return a.d < b.d end)
-        for i = 1, math.min(5, #scored) do
-            table.insert(picks, scored[i].char)
-        end
-    end
-
-    setTargets(picks)
-    print(string.format(
-        "[AnimInspector] Tracking %d target(s)  self=%s  others=%s",
-        #picks,
-        tostring(cfg.trackSelf),
-        tostring(cfg.trackOthers)
-    ))
-end
-
--- ==========================================
--- Main update
--- ==========================================
-
-local function updateTargets()
-    for i = #TargetCharacters, 1, -1 do
-        local char = TargetCharacters[i]
-        local hum = char and char:FindFirstChildOfClass("Humanoid")
-        local hrp = char and char:FindFirstChild("HumanoidRootPart")
-        local tracker = EspTrackers[char]
-
-        if not char or not char.Parent or not hum or not hrp then
-            if tracker and tracker.Destroy then pcall(function() tracker:Destroy() end) end
-            EspTrackers[char] = nil
-            table.remove(TargetCharacters, i)
-            continue
-        end
-
-        local ok, anims = pcall(function() return Tracker:Update(char) end)
-        anims = (ok and anims) or {}
-
-        local lines = {}
-        if #anims == 0 then
-            table.insert(lines, "None playing")
-        else
-            for _, anim in ipairs(anims) do
-                if not anim.AnimationId then continue end
-                local id = tostring(anim.AnimationId)
-                local label = describeAnim(id, anim.Name)
-                logAnim(id, anim)
-
-                table.insert(lines, string.format(
-                    "%s\n  %s\n  %s | t=%.2f spd=%.2f",
-                    anim.Name or "?",
-                    label,
-                    id,
-                    anim.TimePosition or 0,
-                    anim.Speed or 1
-                ))
+            table.sort(scored, function(a, b) return a.d < b.d end)
+            for i = 1, math.min(5, #scored) do
+                table.insert(picks, scored[i].char)
             end
         end
 
-        if tracker and tracker.ChangeText then
-            pcall(function()
-                tracker:ChangeText("Anims", table.concat(lines, "\n\n"), COLOR_WHITE)
-                tracker:ChangeText("Name", string.format("%s [%d logged]", char.Name, #LoggedOrder), COLOR_GREEN)
-            end)
-        end
-    end
+        setTargets(picks)
+    end)
 end
 
--- ==========================================
--- UI (Matcha native)
--- ==========================================
+local function updateTargets()
+    pcall(function()
+        for i = #TargetCharacters, 1, -1 do
+            local char = TargetCharacters[i]
+            local hum = char and char:FindFirstChildOfClass("Humanoid")
+            local hrp = char and char:FindFirstChild("HumanoidRootPart")
+            local tracker = EspTrackers[char]
+
+            if not char or not char.Parent or not hum or not hrp then
+                if tracker and tracker.Destroy then pcall(function() tracker:Destroy() end) end
+                EspTrackers[char] = nil
+                table.remove(TargetCharacters, i)
+                continue
+            end
+
+            local okUpd, anims = pcall(function() return Tracker:Update(char) end)
+            anims = (okUpd and anims) or {}
+
+            local lines = {}
+            if #anims == 0 then
+                table.insert(lines, "None playing")
+            else
+                for _, anim in ipairs(anims) do
+                    if not anim.AnimationId then continue end
+                    local id = normalizeId(anim.AnimationId)
+                    if not id then continue end
+                    local name = displayNameFor(id, anim.Name)
+                    local label = describeAnim(id, anim.Name)
+                    logAnim(id, anim)
+                    table.insert(lines, string.format(
+                        "%s\n  %s\n  %s | t=%.2f spd=%.2f",
+                        name,
+                        label,
+                        id,
+                        anim.TimePosition or 0,
+                        anim.Speed or 1
+                    ))
+                end
+            end
+
+            if tracker and tracker.ChangeText then
+                pcall(function()
+                    tracker:ChangeText("Anims", table.concat(lines, "\n\n"), COLOR_WHITE)
+                    tracker:ChangeText("Name", string.format("%s [%d logged]", char.Name, #LoggedOrder), COLOR_GREEN)
+                end)
+            end
+        end
+    end)
+end
 
 local function buildUI()
     if not UI or not UI.AddTab then
@@ -382,7 +509,6 @@ local function buildUI()
 
     UI.AddTab("AnimInspect", function(tab)
         if cfg.dead then return end
-
         local left = tab:Section("Targets", "Left")
         left:Toggle("ai_self", "Track myself", cfg.trackSelf, function(on)
             cfg.trackSelf = on and true or false
@@ -404,36 +530,30 @@ local function buildUI()
             cfg.selectedFolder = text
             cycleTargets()
         end)
-        -- try common defaults
-        for i, name in ipairs(folders) do
-            if name == "Live" or name == "Players" or name == "Characters" then
-                cfg.selectedFolder = name
-                break
+
+        local preferred = { "Live", "Players", "Characters", "Entities", "Mobs", "NPCs", "Units", "Fighters" }
+        for _, want in ipairs(preferred) do
+            for _, name in ipairs(folders) do
+                if name == want then
+                    cfg.selectedFolder = name
+                    break
+                end
             end
+            if cfg.selectedFolder then break end
         end
         if not cfg.selectedFolder and #folders > 0 then
             cfg.selectedFolder = folders[1]
         end
 
-        left:Button("Refresh targets (X)", function()
-            cycleTargets()
-        end)
+        left:Button("Refresh targets (X)", function() cycleTargets() end)
 
         local right = tab:Section("Log", "Right")
-        right:Button("Copy log to clipboard (C)", function()
-            copyLogged()
-        end)
-        right:Button("Clear log (K)", function()
-            clearLog()
-        end)
-        right:Text("Logged entries show above targets as ESP text.")
-        right:Text("Copy format includes asset id, track name, guessed action, and a config snippet.")
+        right:Button("Copy log to clipboard (C)", function() copyLogged() end)
+        right:Button("Clear log (K)", function() clearLog() end)
+        right:Text("Garbage track names from memory are auto-cleaned.")
+        right:Text("Add known ids to KnownLabels at the top of the script if you want custom names.")
     end)
 end
-
--- ==========================================
--- Input
--- ==========================================
 
 local VK = { X = 0x58, C = 0x43, K = 0x4B }
 local last = { x = false, c = false, k = false }
@@ -458,11 +578,8 @@ safeConnect(UIS and UIS.InputBegan, function(input, gp)
     end
 end)
 
--- ==========================================
--- Loop + lifecycle
--- ==========================================
-
 local lastCycle = 0
+local lastErrorPrint = 0
 
 local function stop()
     if cfg.dead then return end
@@ -484,19 +601,28 @@ _G.__MatchaAnimInspector = { stop = stop, run = THIS_RUN }
 local stepped = RunService and (RunService.RenderStepped or RunService.Heartbeat)
 safeConnect(stepped, function()
     if cfg.dead or _G.__MatchaAnimInspectorRun ~= THIS_RUN then return end
-    pollHotkeys()
-    local now = os.clock()
-    if cfg.autoNearest and (now - lastCycle) > 1.0 then
-        lastCycle = now
-        cycleTargets()
+    local ok, err = pcall(function()
+        pollHotkeys()
+        local now = os.clock()
+        if cfg.autoNearest and (now - lastCycle) > 1.0 then
+            lastCycle = now
+            cycleTargets()
+        end
+        updateTargets()
+    end)
+    if not ok then
+        local t = os.clock()
+        if t - lastErrorPrint > 5 then
+            lastErrorPrint = t
+            warn("[AnimInspector] loop error:", tostring(err))
+        end
     end
-    updateTargets()
 end)
 
 pcall(buildUI)
-cycleTargets()
+pcall(cycleTargets)
 
-print("[AnimInspector] Loaded — X retarget · C copy log · K clear")
+print("[AnimInspector] Loaded (fixed) — X retarget · C copy · K clear")
 pcall(function()
-    if notify then notify("X retarget · C copy · K clear", "Anim Inspector", 4) end
+    if notify then notify("Anim Inspector fixed", "LocalPlayer-safe + clean names", 4) end
 end)
